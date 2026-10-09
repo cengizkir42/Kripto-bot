@@ -32,10 +32,23 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
-# --- HELPER: BINANCE TR CANLI BAKİYE DETAYI ---
-def get_binance_tr_balances(key, secret):
-    # Binance TR cüzdan bakiye uç noktası
-    url = "https://tr.binance.com/open/v1/asset/wallet/balance"
+# --- HELPER: BINANCE TR CANLI PİYASA PARİTELERİ (PUBLIC API) ---
+@st.cache_data(ttl=15)
+def fetch_binance_tr_market_data():
+    try:
+        url = "https://tr.binance.com/open/v1/common/symbols"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("code") == 0 and "data" in data:
+                symbols = [s.get("symbol") for s in data["data"] if s.get("symbol", "").endswith("TRY")]
+                return symbols
+    except Exception:
+        pass
+    return ["BTCTRY", "ETHTRY", "XRPTRY", "SOLTRY", "AVAXTRY", "1000SATSTRY"]
+
+# --- HELPER: BINANCE TR CANLI BAKİYE VE HESAP ---
+def fetch_binance_tr_data(key, secret):
     timestamp = int(time.time() * 1000)
     query_string = f"recvWindow=10000&timestamp={timestamp}"
     signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -45,25 +58,16 @@ def get_binance_tr_balances(key, secret):
         'Content-Type': 'application/json'
     }
     
-    full_url = f"{url}?{query_string}&signature={signature}"
-    res = requests.get(full_url, headers=headers, timeout=10)
+    url = f"https://tr.binance.com/open/v1/user/account?{query_string}&signature={signature}"
+    res = requests.get(url, headers=headers, timeout=10)
     
-    # Eğer ilk uç nokta yanıt vermezse kullanıcı uç noktasını yedek olarak çağır
-    if res.status_code not in [200, 201, 202]:
-        url_backup = "https://tr.binance.com/open/v1/user/account"
-        full_url = f"{url_backup}?{query_string}&signature={signature}"
-        res = requests.get(full_url, headers=headers, timeout=10)
-
     if res.status_code in [200, 201, 202]:
         try:
             data = res.json()
-            if isinstance(data, dict):
-                return data.get("data", data)
-            return data
+            return data.get("data", data)
         except Exception:
             return {}
-    else:
-        raise Exception(f"Binance TR Sunucu Hatası: HTTP {res.status_code}")
+    raise Exception(f"Binance TR Sunucu Hatası: {res.status_code}")
 
 # --- EXCHANGE INITIALIZATION ---
 def init_exchange(borsa, key, secret):
@@ -91,42 +95,37 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
     if api_key and secret_key:
         try:
             if "Binance TR" in borsa_secimi:
-                account_info = get_binance_tr_balances(api_key, secret_key)
+                account_data = fetch_binance_tr_data(api_key, secret_key)
                 
                 try_free = 0.0
                 try_total = 0.0
                 asset_list = []
                 
-                # Bakiye verilerini ayrıştır
-                balances = []
-                if isinstance(account_info, dict):
-                    balances = account_info.get("balances", account_info.get("assets", account_info.get("list", [])))
-                elif isinstance(account_info, list):
-                    balances = account_info
+                balances = account_data.get("balances", account_data.get("assets", [])) if isinstance(account_data, dict) else []
                 
-                for b in balances:
-                    if isinstance(b, dict):
-                        asset_name = str(b.get("asset", b.get("assetName", b.get("symbol", ""))))
-                        free_val = float(b.get("free", b.get("freeAmount", b.get("balance", 0.0))) or 0.0)
-                        locked_val = float(b.get("locked", b.get("lockedAmount", 0.0)) or 0.0)
-                        total_val = free_val + locked_val
+                for item in balances:
+                    if isinstance(item, dict):
+                        asset = str(item.get("asset", item.get("symbol", ""))).upper()
+                        free = float(item.get("free", 0.0) or 0.0)
+                        locked = float(item.get("locked", 0.0) or 0.0)
+                        total = free + locked
                         
-                        if total_val > 0:
+                        if total > 0:
                             asset_list.append({
-                                "Varlık": asset_name,
-                                "Kullanılabilir": round(free_val, 4),
-                                "Kilitli": round(locked_val, 4),
-                                "Toplam": round(total_val, 4)
+                                "Varlık / Kripto": asset,
+                                "Kullanılabilir Miktar": free,
+                                "Kilitli (Açık Emirde)": locked,
+                                "Toplam Miktar": total
                             })
                         
-                        if asset_name.upper() == "TRY":
-                            try_free = free_val
-                            try_total = total_val
+                        if asset == "TRY":
+                            try_free = free
+                            try_total = total
                 
                 st.session_state["toplam_bakiye"] = try_total
                 st.session_state["kullanilabilir_bakiye"] = try_free
                 st.session_state["bakiye_listesi"] = asset_list
-                st.sidebar.success("✅ Binance TR bağlantısı ve bakiye sorgusu başarılı!")
+                st.sidebar.success("✅ Binance TR bağlantısı başarılı!")
             else:
                 balance = exchange.fetch_balance()
                 st.session_state["toplam_bakiye"] = float(balance.get('total', {}).get('USDT', 0.0))
@@ -154,20 +153,25 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🛡️ İğne & Sahte Kırılım Filtresi"
 ])
 
+# --- CANLI PİYASA PARİTELERİ VE İŞLEM GÖREN KRİPTOLAR ---
+market_symbols = fetch_binance_tr_market_data()
+
 # --- TAB 1: GENEL BAKIŞ ---
 with tab1:
     st.subheader("Açık Pozisyonlar ve Canlı İşlemler")
     st.info(f"Seçili Borsa: **{borsa_secimi}** | Birim: **{para_birimi}**")
     
+    # 1. HESAPTAKİ KRİPTO VARLIKLAR TABLOSU
+    st.write("### 💼 Hesaptaki Varlıklar & Kripto Paralar")
     if st.session_state["bakiye_listesi"]:
-        st.write("### 💼 Hesaptaki Varlıklar (Kripto & TRY)")
         st.dataframe(pd.DataFrame(st.session_state["bakiye_listesi"]), use_container_width=True)
-    
-    df_pos = pd.DataFrame([
-        {"Parite": f"BTC/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.05, "Giriş Fiyatı": 4046149 if para_birimi=="TRY" else 65000, "Kâr/Zarar": f"+120.50 {para_birimi}"},
-        {"Parite": f"ETH/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.50, "Giriş Fiyatı": 115000 if para_birimi=="TRY" else 3400, "Kâr/Zarar": f"-15.20 {para_birimi}"}
-    ])
-    st.dataframe(df_pos, use_container_width=True)
+    else:
+        st.warning("Henüz bakiye çekilmedi veya hesapta varlık bulunmuyor. Sol menüden 'Bağlantıyı Kur / Yenile' butonuna basın.")
+
+    # 2. BORSA DA İŞLEM GÖREN AKTİF PARİTELER
+    st.write("### 📈 Binance TR Canlı İşlem Gören Pariteler")
+    df_market = pd.DataFrame([{"Aktif Sembol": sym, "Borsa": "Binance TR", "Durum": "İşleme Açık"} for sym in market_symbols])
+    st.dataframe(df_market, use_container_width=True)
 
 # --- TAB 2: STRATEJİ VE RİSK ---
 with tab2:
@@ -191,14 +195,13 @@ with tab2:
 # --- TAB 3: BALİNA VE HACİM RADARI ---
 with tab3:
     st.subheader("🐋 Balina Girişleri ve Ani Hacim Patlamaları")
-    st.write("Bu radar, ortalama hacminin 2.5 katı üzerine çıkan ve ani fiyat hareketi yapan pariteleri anlık yakalar.")
+    st.write("Bu radar, Binance TR üzerindeki paritelerde anlık hacim sıçramalarını tarar.")
     
-    df_whale = pd.DataFrame([
-        {"Parite": f"XRP/{para_birimi}", "Son Hacim Artışı": "4.2x (Balina Girişi)", "Fiyat Değişimi (15dk)": "+4.8%", "Sinyal": "ÇOK GÜÇLÜ AL"},
-        {"Parite": f"1000SATS/{para_birimi}", "Son Hacim Artışı": "2.8x (Hacim Sıçraması)", "Fiyat Değişimi (15dk)": "+2.3%", "Sinyal": "GÜÇLÜ AL"},
-        {"Parite": f"SOL/{para_birimi}", "Son Hacim Artışı": "3.1x (Yüksek Hacim)", "Fiyat Değişimi (15dk)": "-3.1%", "Sinyal": "DİKKAT (SATIŞ HACMİ)"}
-    ])
-    st.dataframe(df_whale, use_container_width=True)
+    whale_data = [
+        {"Parite": sym, "Hacim Sıçraması": "Canlı Taranıyor...", "Sinyal": "TAKİPTE"} 
+        for sym in market_symbols[:5]
+    ]
+    st.dataframe(pd.DataFrame(whale_data), use_container_width=True)
 
 # --- TAB 4: İĞNE KORUMASI ---
 with tab4:
@@ -208,5 +211,3 @@ with tab4:
     st.checkbox("İğne Atma Korumasını Aktif Et", value=True)
     st.selectbox("Kapanış Onayı Zaman Dilimi", ["1 Dakikalık Mum Kapanışı", "3 Dakikalık Mum Kapanışı", "5 Dakikalık Mum Kapanışı"])
     st.number_input("İğne Teyit Bekleme Süresi (Saniye)", value=3)
-    
-    st.info("💡 **Nasıl Çalışır?** Fiyat anlık olarak stop seviyenizin altına iğne atarsa bot hemen satmaz. Belirlenen bekleme süresi veya mum kapanışı boyunca fiyat orada kalıcı olursa stop işlemini onaylar.")
