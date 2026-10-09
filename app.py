@@ -30,8 +30,14 @@ def init_exchange(borsa, key, secret):
             return ccxt.binance({
                 'apiKey': key,
                 'secret': secret,
-                'hostname': 'tr.binance.com',
-                'enableRateLimit': True
+                'enableRateLimit': True,
+                'options': {'adjustForTimeDifference': True},
+                'urls': {
+                    'api': {
+                        'public': 'https://tr.binance.com/open/v1',
+                        'private': 'https://tr.binance.com/open/v1',
+                    }
+                }
             })
         elif "Binance USDT-M" in borsa:
             return ccxt.binance({
