@@ -6,509 +6,453 @@ from urllib.parse import urlencode
 import requests
 import pandas as pd
 import streamlit as st
-import ccxt
 
-# =========================================================
-# CEX T1 - KRİPTO VE BALİNA RADARI
-# Güvenli sürüm: otomatik emir göndermez.
-# =========================================================
-
-BASE_URL = "https://www.binance.tr"
-TIMEOUT = 10
+BASE = "https://www.binance.tr"
+TIMEOUT = 12
 
 st.set_page_config(
-    page_title="CEX T1 - Kripto Bot",
-    page_icon="🤖",
+    page_title="CEX T1 V2",
+    page_icon="🐋",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-st.title("🤖 CEX T1 - Kripto ve Balina Radarı")
-st.caption("Canlı veri analizi • Gerçek emir gönderimi kapalı")
+st.title("🤖 CEX T1 V2 | Kripto Radar")
+st.caption("Canlı piyasa • Hacim anomalisi • Risk izleme")
+st.warning("Güvenli mod: Bu uygulama gerçek alım satım emri göndermez.")
 
-# ---------------- SESSION STATE --------------------------
+if "account_assets" not in st.session_state:
+    st.session_state.account_assets = []
+if "account_status" not in st.session_state:
+    st.session_state.account_status = "Bağlanmadı"
+if "strategy" not in st.session_state:
+    st.session_state.strategy = {}
 
-DEFAULTS = {
-    "toplam_bakiye": 0.0,
-    "kullanilabilir_bakiye": 0.0,
-    "bakiye_listesi": [],
-    "ayarlar": {},
-    "son_baglanti": "",
-    "baglanti_durumu": "Bağlantı kurulmadı",
-}
+# ---------- API YARDIMCILARI ----------
 
-for key, value in DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-# ---------------- HTTP YARDIMCISI ------------------------
-
-def api_get(path, params=None, headers=None):
-    """HTTP isteği yapar; hatalı yanıtları gizlemez."""
-    response = requests.get(
-        BASE_URL + path,
+def get_json(url, params=None, headers=None):
+    r = requests.get(
+        url,
         params=params,
         headers=headers,
         timeout=TIMEOUT,
     )
-    response.raise_for_status()
-
-    data = response.json()
+    if r.status_code == 451:
+        raise RuntimeError(
+            "Borsa bu sunucu isteğini 451 ile reddetti. "
+            "API erişim politikası veya ağ kaynaklı olabilir."
+        )
+    r.raise_for_status()
+    data = r.json()
 
     if isinstance(data, dict):
         code = data.get("code")
         if code not in (None, 0, "0"):
             raise RuntimeError(
-                f"Borsa API hatası: {data.get('msg', data)}"
+                str(data.get("msg", "Borsa API hatası"))
             )
-
     return data
 
 
-# ---------------- BINANCE TR SEMBOLLER -------------------
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_binance_tr_symbols():
-    """Resmi sembol listesinden TRY paritelerini alır."""
-    data = api_get("/open/v1/common/symbols")
-
-    payload = data.get("data", {})
-    if isinstance(payload, dict):
-        symbols = payload.get("list", [])
-    elif isinstance(payload, list):
-        symbols = payload
-    else:
-        symbols = []
-
-    result = []
-
-    for item in symbols:
-        if not isinstance(item, dict):
-            continue
-
-        symbol = str(item.get("symbol", "")).upper()
-        quote = str(item.get("quoteAsset", "")).upper()
-
-        if quote == "TRY" or symbol.endswith("_TRY"):
-            result.append(symbol)
-
-    if not result:
-        raise RuntimeError(
-            "API yanıtında aktif TRY paritesi bulunamadı."
-        )
-
-    return sorted(set(result))
+def tr_get(path, params=None):
+    return get_json(BASE + path, params=params)
 
 
-# ---------------- BINANCE TR HESAP -----------------------
-
-def fetch_binance_tr_account(api_key, secret_key):
-    """Salt okunur hesap bilgisi. Emir göndermez."""
-    timestamp = int(time.time() * 1000)
-
+def account_request(key, secret):
     params = {
-        "recvWindow": 10000,
-        "timestamp": timestamp,
+        "recvWindow": 5000,
+        "timestamp": int(time.time() * 1000),
     }
-
     query = urlencode(params)
-
-    signature = hmac.new(
-        secret_key.encode("utf-8"),
-        query.encode("utf-8"),
+    params["signature"] = hmac.new(
+        secret.encode(),
+        query.encode(),
         hashlib.sha256,
     ).hexdigest()
 
-    headers = {
-        "X-MBX-APIKEY": api_key,
-    }
-
-    data = api_get(
+    return tr_get(
         "/open/v1/account/spot",
-        params={**params, "signature": signature},
-        headers=headers,
+        params=params,
+    ) if False else get_json(
+        BASE + "/open/v1/account/spot",
+        params=params,
+        headers={"X-MBX-APIKEY": key},
     )
 
-    account = data.get("data", {})
 
-    if not isinstance(account, dict):
-        raise RuntimeError("Hesap API yanıtı beklenen formatta değil.")
+# ---------- SEMBOL LİSTESİ ----------
 
-    assets = account.get("accountAssets", [])
+@st.cache_data(ttl=120, show_spinner=False)
+def load_symbols():
+    data = tr_get("/open/v1/common/symbols")
+    body = data.get("data", {})
+    items = body.get("list", []) if isinstance(body, dict) else body
 
-    if not isinstance(assets, list):
-        raise RuntimeError("Hesap varlık listesi geçersiz.")
-
-    rows = []
-    total_try = 0.0
-    free_try = 0.0
-
-    for item in assets:
+    symbols = []
+    for item in items:
         if not isinstance(item, dict):
             continue
 
-        asset = str(item.get("asset", "")).upper()
+        quote = str(item.get("quoteAsset", "")).upper()
+        symbol = str(item.get("symbol", "")).upper()
+        status = str(item.get("status", "")).upper()
 
-        try:
-            free = float(item.get("free", 0) or 0)
-            locked = float(item.get("locked", 0) or 0)
-        except (TypeError, ValueError):
-            continue
+        if quote == "TRY" or symbol.endswith("_TRY"):
+            if status in ("", "TRADING", "1"):
+                symbols.append(symbol)
 
-        total = free + locked
+    if not symbols:
+        raise RuntimeError("API geçerli TRY paritesi döndürmedi.")
 
-        if total > 0:
-            rows.append({
-                "Varlık": asset,
-                "Kullanılabilir": free,
-                "Kilitlemiş / Emirde": locked,
-                "Toplam": total,
-            })
-
-        if asset == "TRY":
-            free_try = free
-            total_try = total
-
-    return rows, free_try, total_try
+    return sorted(set(symbols))
 
 
-# ---------------- CCXT BAĞLANTISI ------------------------
+# ---------- PİYASA VERİSİ ----------
 
-def init_exchange(exchange_name, api_key, secret_key):
-    if not api_key or not secret_key:
-        raise ValueError("API Key ve Secret Key gerekli.")
+def market_symbol(symbol):
+    # Binance TR ana sembollerinde ADA_TRY gibi adlar kullanılır.
+    return symbol.replace("_", "")
 
-    if exchange_name == "Binance USDT-M (Vadeli)":
-        exchange = ccxt.binance({
-            "apiKey": api_key,
-            "secret": secret_key,
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        })
-    elif exchange_name == "OKX Futures":
-        exchange = ccxt.okx({
-            "apiKey": api_key,
-            "secret": secret_key,
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"},
-        })
+
+def load_klines(symbol, interval="1m", limit=30):
+    # Dokümantasyonda ana semboller için bu piyasa adresi belirtilir.
+    params = {
+        "symbol": market_symbol(symbol),
+        "interval": interval,
+        "limit": limit,
+    }
+
+    data = get_json(
+        "https://api.binance.me/api/v1/klines",
+        params=params,
+    )
+
+    rows = data.get("data", []) if isinstance(data, dict) else data
+
+    if not rows:
+        raise RuntimeError("Mum verisi boş geldi.")
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "time", "open", "high", "low", "close",
+            "volume", "close_time", "quote_volume",
+            "trades", "buy_volume", "buy_quote_volume", "ignore",
+        ],
+    )
+
+    for col in [
+        "open", "high", "low", "close",
+        "volume", "quote_volume", "buy_quote_volume",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["close", "volume"])
+    return df
+
+
+def analyze_symbol(symbol):
+    df = load_klines(symbol)
+
+    if len(df) < 5:
+        raise RuntimeError("Analiz için yeterli mum yok.")
+
+    # Son mum hâlâ açık olabileceği için kapanmış mumları kullan.
+    closed = df.iloc[:-1].copy()
+    if len(closed) < 4:
+        raise RuntimeError("Yeterli kapanmış mum bulunamadı.")
+
+    last = closed.iloc[-1]
+    previous = closed.iloc[-4:-1]
+
+    old_volume = float(previous["volume"].mean())
+    current_volume = float(last["volume"])
+    volume_ratio = (
+        current_volume / old_volume if old_volume > 0 else 0
+    )
+
+    first_close = float(closed.iloc[-2]["close"])
+    last_close = float(last["close"])
+    change_pct = (
+        (last_close / first_close - 1) * 100
+        if first_close else 0
+    )
+
+    candle_range = float(last["high"] - last["low"])
+    candle_body = abs(float(last["close"] - last["open"]))
+    wick_ratio = (
+        (candle_range - candle_body) / candle_range
+        if candle_range > 0 else 0
+    )
+
+    if volume_ratio >= 3:
+        signal = "HACİM SIÇRAMASI"
+    elif change_pct >= 1:
+        signal = "YUKARI HAREKET"
+    elif change_pct <= -1:
+        signal = "AŞAĞI HAREKET"
     else:
-        return None
+        signal = "TAKİPTE"
 
-    return exchange
+    return {
+        "Parite": symbol,
+        "Son kapanış": last_close,
+        "Değişim %": round(change_pct, 3),
+        "Hacim oranı": round(volume_ratio, 2),
+        "Fitil oranı %": round(wick_ratio * 100, 1),
+        "Durum": signal,
+    }
 
 
-# ---------------- SIDEBAR --------------------------------
+# ---------- SOL MENÜ ----------
 
-st.sidebar.header("🔌 Borsa ve Bağlantı")
+st.sidebar.header("Borsa bağlantısı")
+st.sidebar.caption("API anahtarlarını GitHub koduna yazma.")
 
-borsa = st.sidebar.selectbox(
-    "Borsa seçin",
-    [
-        "Binance TR (Spot - TRY)",
-        "Binance USDT-M (Vadeli)",
-        "OKX Futures",
-    ],
-)
+api_key = st.sidebar.text_input("API Key", type="password")
+secret_key = st.sidebar.text_input("Secret Key", type="password")
 
-api_key = st.sidebar.text_input(
-    "API Key",
-    type="password",
-)
-
-secret_key = st.sidebar.text_input(
-    "Secret Key",
-    type="password",
-)
-
-birim = "TRY" if borsa.startswith("Binance TR") else "USDT"
-
-if st.sidebar.button("Bağlantıyı Kur / Yenile", type="primary"):
+if st.sidebar.button("Hesap bağlantısını kontrol et"):
     if not api_key or not secret_key:
-        st.sidebar.warning("İki API alanını da doldur.")
+        st.sidebar.warning("İki alanı da doldur.")
     else:
         try:
-            if borsa.startswith("Binance TR"):
-                rows, free, total = fetch_binance_tr_account(
-                    api_key, secret_key
+            result = account_request(api_key, secret_key)
+            account = result.get("data", {})
+            assets = account.get("accountAssets", [])
+
+            if not isinstance(assets, list):
+                raise RuntimeError(
+                    "Hesap varlık yanıtı beklenen biçimde değil."
                 )
 
-                st.session_state["bakiye_listesi"] = rows
-                st.session_state["kullanilabilir_bakiye"] = free
-                st.session_state["toplam_bakiye"] = total
+            rows = []
+            for item in assets:
+                free = float(item.get("free", 0) or 0)
+                locked = float(item.get("locked", 0) or 0)
 
-            else:
-                exchange = init_exchange(
-                    borsa, api_key, secret_key
-                )
+                if free + locked > 0:
+                    rows.append({
+                        "Varlık": item.get("asset", "?"),
+                        "Kullanılabilir": free,
+                        "Kilitlemiş": locked,
+                        "Toplam": free + locked,
+                    })
 
-                balance = exchange.fetch_balance()
+            st.session_state.account_assets = rows
+            st.session_state.account_status = "Bağlantı başarılı"
+            st.sidebar.success("Hesap bilgisi alındı.")
 
-                total = float(
-                    balance.get("total", {}).get("USDT") or 0
-                )
-                free = float(
-                    balance.get("free", {}).get("USDT") or 0
-                )
+        except Exception as e:
+            st.session_state.account_status = "Bağlantı hatası"
+            st.sidebar.error(str(e))
 
-                st.session_state["toplam_bakiye"] = total
-                st.session_state["kullanilabilir_bakiye"] = free
+st.sidebar.write("Durum:", st.session_state.account_status)
 
-                totals = balance.get("total", {})
-                frees = balance.get("free", {})
-                used = balance.get("used", {})
+# ---------- ÖZET ----------
 
-                st.session_state["bakiye_listesi"] = [
-                    {
-                        "Varlık": asset,
-                        "Kullanılabilir": float(frees.get(asset) or 0),
-                        "Kilitlemiş / Emirde": float(used.get(asset) or 0),
-                        "Toplam": float(amount or 0),
-                    }
-                    for asset, amount in totals.items()
-                    if amount and float(amount) > 0
-                ]
+a, b, c = st.columns(3)
+a.metric("Çalışma modu", "Analiz")
+b.metric("Gerçek emir", "Kapalı")
+c.metric("Hesap", st.session_state.account_status)
 
-            st.session_state["baglanti_durumu"] = "Bağlantı başarılı"
-            st.session_state["son_baglanti"] = time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            st.sidebar.success("Bağlantı başarılı.")
-
-        except Exception as exc:
-            st.session_state["baglanti_durumu"] = "Bağlantı hatası"
-            st.sidebar.error(f"Bağlantı kurulamadı: {exc}")
-
-
-# ---------------- HESAP ÖZETİ ----------------------------
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    "Toplam Bakiye",
-    f"{st.session_state['toplam_bakiye']:,.2f} {birim}",
-)
-c2.metric(
-    "Kullanılabilir",
-    f"{st.session_state['kullanilabilir_bakiye']:,.2f} {birim}",
-)
-c3.metric("Gerçekleşen K/Z", "Hesaplanmadı")
-c4.metric("Bağlantı", st.session_state["baglanti_durumu"])
-
-if st.session_state["son_baglanti"]:
-    st.caption("Son bağlantı: " + st.session_state["son_baglanti"])
-
-st.warning(
-    "Bu sürüm otomatik alım satım yapmaz. "
-    "Toplam hesap değeri, bütün kripto varlıkların TRY/USDT "
-    "karşılığını hesaplamaz; yalnızca seçili para birimindeki "
-    "bakiye gösterilir."
-)
-
-# ---------------- SEKME YAPISI ---------------------------
-
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "📊 Genel Bakış",
-    "⚙️ Strateji ve Risk",
     "🐋 Hacim Radarı",
-    "🛡️ İğne Filtresi",
+    "🛡️ Risk ve İğne Filtresi",
 ])
 
-
-# ---------------- TAB 1: GENEL BAKIŞ ---------------------
+# ---------- GENEL BAKIŞ ----------
 
 with tab1:
     st.subheader("Hesaptaki varlıklar")
 
-    assets = st.session_state["bakiye_listesi"]
-
-    if assets:
+    if st.session_state.account_assets:
         st.dataframe(
-            pd.DataFrame(assets),
+            pd.DataFrame(st.session_state.account_assets),
             use_container_width=True,
             hide_index=True,
         )
     else:
-        st.info("Önce sol menüden hesap bağlantısını kur.")
+        st.info("Hesap bakiyesi için sol menüden bağlantı kur.")
 
-    st.subheader("Binance TR işlem pariteleri")
+    st.subheader("TRY pariteleri")
 
-    try:
-        symbols = fetch_binance_tr_symbols()
+    if st.button("Parite listesini getir"):
+        try:
+            symbols = load_symbols()
+            st.session_state["symbols"] = symbols
+            st.success(f"{len(symbols)} parite bulundu.")
+        except Exception as e:
+            st.error(f"Parite listesi alınamadı: {e}")
 
-        st.success(f"{len(symbols)} TRY paritesi listelendi.")
-
+    symbols = st.session_state.get("symbols", [])
+    if symbols:
         st.dataframe(
-            pd.DataFrame({
-                "Sembol": symbols,
-                "Borsa": ["Binance TR"] * len(symbols),
-            }),
+            pd.DataFrame({"Parite": symbols}),
             use_container_width=True,
             hide_index=True,
         )
 
-    except Exception as exc:
-        st.error(f"Parite listesi alınamadı: {exc}")
-
-
-# ---------------- TAB 2: STRATEJİ VE RİSK ----------------
+# ---------- HACİM RADARI ----------
 
 with tab2:
-    st.subheader("Strateji parametreleri")
+    st.subheader("Gerçek mum verisiyle hacim taraması")
 
-    with st.form("strategy_form"):
-        left, right = st.columns(2)
+    try:
+        symbols = st.session_state.get("symbols") or load_symbols()
+        st.session_state["symbols"] = symbols
 
-        with left:
-            max_entry = st.number_input(
-                f"Giriş tutarı üst sınırı ({birim})",
-                min_value=0.0,
-                value=1000.0 if birim == "TRY" else 40.0,
-                step=10.0,
-            )
+        # İstek yükünü kontrol altında tutmak için tarama sınırı.
+        limit = st.slider(
+            "Taranacak ilk parite sayısı",
+            min_value=1,
+            max_value=min(30, len(symbols)),
+            value=min(10, len(symbols)),
+        )
 
-            risk_pct = st.number_input(
-                "Pozisyon başına risk (%)",
-                min_value=0.1,
-                max_value=100.0,
-                value=1.0,
-                step=0.1,
-            )
+        if st.button("Taramayı başlat", type="primary"):
+            results = []
+            errors = []
 
-            stop_loss = st.number_input(
-                "Stop-loss (%)",
-                min_value=0.1,
-                max_value=50.0,
-                value=1.5,
-                step=0.1,
-            )
+            progress = st.progress(0)
 
-            liquidation_buffer = st.number_input(
-                "Tasfiye koruma mesafesi (%)",
-                min_value=0.1,
-                max_value=50.0,
-                value=1.5,
-                step=0.1,
-            )
+            for i, symbol in enumerate(symbols[:limit]):
+                try:
+                    results.append(analyze_symbol(symbol))
+                except Exception as e:
+                    errors.append({
+                        "Parite": symbol,
+                        "Hata": str(e),
+                    })
 
-        with right:
-            take_profit = st.number_input(
-                "Kâr hedefi (%)",
-                min_value=0.1,
-                max_value=100.0,
-                value=2.5,
-                step=0.1,
-            )
+                progress.progress((i + 1) / limit)
 
-            trailing_stop = st.number_input(
-                "Trailing stop (%)",
-                min_value=0.1,
-                max_value=50.0,
-                value=1.0,
-                step=0.1,
-            )
+            if results:
+                result_df = pd.DataFrame(results)
+                result_df = result_df.sort_values(
+                    "Hacim oranı", ascending=False
+                )
+                st.dataframe(
+                    result_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            score_threshold = st.number_input(
-                "Sinyal puanı eşiği",
-                min_value=1,
-                max_value=100,
-                value=75,
-            )
+            if errors:
+                with st.expander(
+                    f"Veri alınamayan pariteler ({len(errors)})"
+                ):
+                    st.dataframe(
+                        pd.DataFrame(errors),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-            max_positions = st.number_input(
-                "Maksimum açık pozisyon",
-                min_value=1,
-                max_value=20,
-                value=2,
-                step=1,
-            )
+            if not results:
+                st.error(
+                    "Hiçbir pariteden veri alınamadı. "
+                    "API erişimini ve sembol biçimini kontrol et."
+                )
 
-        submitted = st.form_submit_button("Ayarları Kaydet")
-
-    if submitted:
-        st.session_state["ayarlar"] = {
-            "max_entry": max_entry,
-            "risk_pct": risk_pct,
-            "stop_loss": stop_loss,
-            "liquidation_buffer": liquidation_buffer,
-            "take_profit": take_profit,
-            "trailing_stop": trailing_stop,
-            "score_threshold": score_threshold,
-            "max_positions": max_positions,
-        }
-
-        st.success("Ayarlar mevcut oturum için kaydedildi.")
-
-    if st.session_state["ayarlar"]:
-        st.json(st.session_state["ayarlar"])
+    except Exception as e:
+        st.error(f"Radar başlatılamadı: {e}")
 
     st.caption(
-        "Ayarlar henüz işlem motoruna bağlı değil ve uygulama "
-        "yeniden başlatıldığında kalıcı olarak saklanmaz."
+        "Hacim oranı, son kapanmış mumun hacmini önceki "
+        "3 kapanmış mumun ortalamasıyla karşılaştırır. "
+        "Bu tek başına balina işlemi kanıtı değildir."
     )
 
-
-# ---------------- TAB 3: HACİM RADARI ---------------------
+# ---------- RİSK VE FİLTRE ----------
 
 with tab3:
-    st.subheader("🐋 Hacim ve olağan dışı hareket radarı")
+    st.subheader("Risk parametreleri")
+
+    with st.form("risk_form"):
+        budget = st.number_input(
+            "İşlem bütçesi (TRY)",
+            min_value=0.0,
+            value=1000.0,
+            step=100.0,
+        )
+        risk_pct = st.number_input(
+            "İşlem başına risk (%)",
+            min_value=0.1,
+            max_value=5.0,
+            value=1.0,
+            step=0.1,
+        )
+        stop_pct = st.number_input(
+            "Stop-loss mesafesi (%)",
+            min_value=0.1,
+            max_value=20.0,
+            value=1.5,
+            step=0.1,
+        )
+        target_pct = st.number_input(
+            "Kâr hedefi (%)",
+            min_value=0.1,
+            max_value=50.0,
+            value=2.5,
+            step=0.1,
+        )
+        wick_filter = st.checkbox(
+            "Yüksek fitil oranını uyarı olarak göster",
+            value=True,
+        )
+        threshold = st.slider(
+            "Fitil uyarı eşiği (%)",
+            min_value=20,
+            max_value=95,
+            value=65,
+        )
+
+        save = st.form_submit_button("Ayarları kaydet")
+
+    if save:
+        st.session_state.strategy = {
+            "budget": budget,
+            "risk_pct": risk_pct,
+            "stop_pct": stop_pct,
+            "target_pct": target_pct,
+            "wick_filter": wick_filter,
+            "wick_threshold": threshold,
+        }
+
+    if st.session_state.strategy:
+        settings = st.session_state.strategy
+        st.success("Ayarlar bu oturum için kaydedildi.")
+        st.write(
+            "Planlanan risk bütçesi:",
+            round(
+                settings["budget"] * settings["risk_pct"] / 100,
+                2,
+            ),
+            "TRY",
+        )
+        st.write(
+            "Stop mesafesi:",
+            settings["stop_pct"],
+            "%",
+            "| Kâr hedefi:",
+            settings["target_pct"],
+            "%",
+        )
+
+        if settings["wick_filter"]:
+            st.write(
+                "Fitil uyarı eşiği:",
+                settings["wick_threshold"],
+                "%",
+            )
 
     st.info(
-        "Sembol listesi tek başına hacim analizi değildir. "
-        "Gerçek hacim ve fiyat uç noktası doğrulanmadan "
-        "balina sinyali üretilmez."
+        "Bu risk ayarları yalnızca hesaplama ve görüntüleme içindir. "
+        "Emir oluşturmaz, stop emri göndermez ve tasfiyeyi engellemez."
     )
-
-    if st.button("Sembol listesini yenile"):
-        fetch_binance_tr_symbols.clear()
-        st.rerun()
-
-    st.write(
-        "Bir sonraki aşamada her parite için gerçek işlem hacmi, "
-        "1 dakikalık mumlar ve büyük işlem verileri alınarak "
-        "karşılaştırmalı sinyal tablosu eklenebilir."
-    )
-
-
-# ---------------- TAB 4: İĞNE FİLTRESİ -------------------
-
-with tab4:
-    st.subheader("🛡️ İğne ve sahte kırılım filtresi")
-
-    enabled = st.checkbox(
-        "İğne filtresi etkin",
-        value=True,
-    )
-
-    timeframe = st.selectbox(
-        "Kapanış teyit aralığı",
-        ["1 dakika", "3 dakika", "5 dakika"],
-    )
-
-    wait_seconds = st.number_input(
-        "Teyit bekleme süresi (saniye)",
-        min_value=0,
-        max_value=300,
-        value=3,
-    )
-
-    st.write({
-        "Filtre etkin": enabled,
-        "Teyit aralığı": timeframe,
-        "Bekleme saniyesi": wait_seconds,
-    })
-
-    st.caption(
-        "Bu parametreler şu an yalnızca yapılandırmadır. "
-        "Mum verisine uygulanan bir filtre veya otomatik emir "
-        "mekanizması değildir."
-    )
-
-# ---------------- FOOTER ---------------------------------
 
 st.divider()
 st.caption(
-    "CEX T1 • Piyasa verisi ve hesap görüntüleme prototipi • "
-    "Otomatik emir gönderimi kapalı"
+    "CEX T1 V2 • Veri alınamadığında hata gösterilir; "
+    "örnek veriler gerçek piyasa verisi gibi sunulmaz."
 )
