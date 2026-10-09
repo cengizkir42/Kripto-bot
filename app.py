@@ -16,6 +16,8 @@ if "toplam_bakiye" not in st.session_state:
     st.session_state["toplam_bakiye"] = 0.0
 if "kullanilabilir_bakiye" not in st.session_state:
     st.session_state["kullanilabilir_bakiye"] = 0.0
+if "bakiye_listesi" not in st.session_state:
+    st.session_state["bakiye_listesi"] = []
 
 # --- SIDEBAR CONFIG ---
 st.sidebar.header("BORSA VE BAĞLANTI")
@@ -30,7 +32,7 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
-# --- HELPER: BINANCE TR CANLI BAKİYE VE HESAP VERİSİ ---
+# --- HELPER: BINANCE TR CANLI BAKİYE KONTROLÜ ---
 def get_binance_tr_account(key, secret):
     url = "https://tr.binance.com/open/v1/user/account"
     timestamp = int(time.time() * 1000)
@@ -86,20 +88,36 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
                 
                 try_free = 0.0
                 try_total = 0.0
+                asset_list = []
                 
+                # Binance TR bakiye listesini bul
                 balances = []
                 if isinstance(account_info, dict):
-                    balances = account_info.get("balances", [])
+                    balances = account_info.get("balances", account_info.get("assets", []))
                 
                 for b in balances:
-                    if isinstance(b, dict) and b.get("asset") == "TRY":
-                        try_free = float(b.get("free") or 0.0)
-                        try_total = try_free + float(b.get("locked") or 0.0)
-                        break
+                    if isinstance(b, dict):
+                        asset_name = b.get("asset", b.get("assetName", ""))
+                        free_val = float(b.get("free", b.get("freeAmount", 0.0)) or 0.0)
+                        locked_val = float(b.get("locked", b.get("lockedAmount", 0.0)) or 0.0)
+                        total_val = free_val + locked_val
+                        
+                        if total_val > 0:
+                            asset_list.append({
+                                "Varlık": asset_name,
+                                "Kullanılabilir": free_val,
+                                "Kilitli": locked_val,
+                                "Toplam": total_val
+                            })
+                        
+                        if asset_name == "TRY":
+                            try_free = free_val
+                            try_total = total_val
                 
                 st.session_state["toplam_bakiye"] = try_total
                 st.session_state["kullanilabilir_bakiye"] = try_free
-                st.sidebar.success("✅ Binance TR bağlantısı başarılı!")
+                st.session_state["bakiye_listesi"] = asset_list
+                st.sidebar.success("✅ Binance TR bağlantısı ve bakiye sorgusu başarılı!")
             else:
                 balance = exchange.fetch_balance()
                 st.session_state["toplam_bakiye"] = float(balance.get('total', {}).get('USDT', 0.0))
@@ -131,6 +149,10 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("Açık Pozisyonlar ve Canlı İşlemler")
     st.info(f"Seçili Borsa: **{borsa_secimi}** | Birim: **{para_birimi}**")
+    
+    if st.session_state["bakiye_listesi"]:
+        st.write("### 💼 Hesaptaki Varlıklar")
+        st.dataframe(pd.DataFrame(st.session_state["bakiye_listesi"]), use_container_width=True)
     
     df_pos = pd.DataFrame([
         {"Parite": f"BTC/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.05, "Giriş Fiyatı": 4046149 if para_birimi=="TRY" else 65000, "Kâr/Zarar": f"+120.50 {para_birimi}"},
