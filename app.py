@@ -1,458 +1,320 @@
-import time
-import hmac
-import hashlib
-from urllib.parse import urlencode
-
-import requests
-import pandas as pd
 import streamlit as st
+import requests, time, hmac, hashlib
+from urllib.parse import urlencode
+from decimal import Decimal, InvalidOperation
+import pandas as pd
 
-BASE = "https://www.binance.tr"
+st.set_page_config(page_title="CEX T1 • Kripto Bot", page_icon="🤖", layout="wide")
+
+TR_BASE = "https://www.binance.tr"
+PUBLIC_BASES = ["https://api.binance.me", "https://www.binance.tr"]
 TIMEOUT = 12
 
-st.set_page_config(
-    page_title="CEX T1 V2",
-    page_icon="🐋",
-    layout="wide",
-)
+st.markdown(""" <style> .stApp {background: radial-gradient(circle at 15% 0%, #172b50 0, #080d1b 48%, #03060d 100%); color:#eaf6ff} [data-testid="stSidebar"] {background:linear-gradient(180deg,#17233e,#0a1020)} h1,h2,h3 {color:#eaf6ff} div[data-testid="stMetric"] {background:rgba(20,37,67,.65);padding:14px;border:1px solid #284666;border-radius:14px} div.stButton>button {border-radius:10px;font-weight:700} </style> """, unsafe_allow_html=True)
 
-st.title("🤖 CEX T1 V2 | Kripto Radar")
-st.caption("Canlı piyasa • Hacim anomalisi • Risk izleme")
-st.warning("Güvenli mod: Bu uygulama gerçek alım satım emri göndermez.")
-
-if "account_assets" not in st.session_state:
-    st.session_state.account_assets = []
-if "account_status" not in st.session_state:
-    st.session_state.account_status = "Bağlanmadı"
-if "strategy" not in st.session_state:
-    st.session_state.strategy = {}
-
-# ---------- API YARDIMCILARI ----------
-
-def get_json(url, params=None, headers=None):
-    r = requests.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=TIMEOUT,
-    )
+def request_json(url, params=None, method="GET", headers=None, timeout=TIMEOUT):
+    r = requests.request(method, url, params=params if method == "GET" else None,
+                         data=params if method != "GET" else None,
+                         headers=headers, timeout=timeout)
     if r.status_code == 451:
-        raise RuntimeError(
-            "Borsa bu sunucu isteğini 451 ile reddetti. "
-            "API erişim politikası veya ağ kaynaklı olabilir."
-        )
+        raise RuntimeError(f"HTTP 451: {url} bu sunucudan erişimi reddediyor. Bu kodun içinden düzeltilemeyebilir; farklı ağ/host veya borsa erişim izni gerekir.")
     r.raise_for_status()
-    data = r.json()
-
-    if isinstance(data, dict):
-        code = data.get("code")
-        if code not in (None, 0, "0"):
-            raise RuntimeError(
-                str(data.get("msg", "Borsa API hatası"))
-            )
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"API JSON döndürmedi (HTTP {r.status_code}).")
+    if isinstance(data, dict) and data.get("code") not in (None, 0, "0"):
+        raise RuntimeError(f"API yanıtı: {data.get('msg') or data.get('message') or data.get('code')}")
     return data
 
+def signed_request(path, api_key, secret, params=None, method="GET"):
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000)
+    p["recvWindow"] = 5000
+    query = urlencode(p)
+    signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    url = TR_BASE + path
+    if method == "GET" or method == "DELETE":
+        return request_json(url + "?" + query + "&signature=" + signature,
+                            method=method, headers=headers)
+    body = p.copy()
+    body["signature"] = signature
+    return request_json(url, params=body, method=method, headers=headers)
 
-def tr_get(path, params=None):
-    return get_json(BASE + path, params=params)
+def unwrap_list(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            for key in ("list", "balances", "symbols", "rows"):
+                if isinstance(data.get(key), list):
+                    return data[key]
+        if isinstance(data, list):
+            return data
+    return []
 
-
-def account_request(key, secret):
-    params = {
-        "recvWindow": 5000,
-        "timestamp": int(time.time() * 1000),
-    }
-    query = urlencode(params)
-    params["signature"] = hmac.new(
-        secret.encode(),
-        query.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
-    return tr_get(
-        "/open/v1/account/spot",
-        params=params,
-    ) if False else get_json(
-        BASE + "/open/v1/account/spot",
-        params=params,
-        headers={"X-MBX-APIKEY": key},
-    )
-
-
-# ---------- SEMBOL LİSTESİ ----------
-
-@st.cache_data(ttl=120, show_spinner=False)
-def load_symbols():
-    data = tr_get("/open/v1/common/symbols")
-    body = data.get("data", {})
-    items = body.get("list", []) if isinstance(body, dict) else body
-
-    symbols = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        quote = str(item.get("quoteAsset", "")).upper()
-        symbol = str(item.get("symbol", "")).upper()
-        status = str(item.get("status", "")).upper()
-
-        if quote == "TRY" or symbol.endswith("_TRY"):
-            if status in ("", "TRADING", "1"):
-                symbols.append(symbol)
-
-    if not symbols:
-        raise RuntimeError("API geçerli TRY paritesi döndürmedi.")
-
-    return sorted(set(symbols))
-
-
-# ---------- PİYASA VERİSİ ----------
-
-def market_symbol(symbol):
-    # Binance TR ana sembollerinde ADA_TRY gibi adlar kullanılır.
-    return symbol.replace("_", "")
-
-
-def load_klines(symbol, interval="1m", limit=30):
-    # Dokümantasyonda ana semboller için bu piyasa adresi belirtilir.
-    params = {
-        "symbol": market_symbol(symbol),
-        "interval": interval,
-        "limit": limit,
-    }
-
-    data = get_json(
-        "https://api.binance.me/api/v1/klines",
-        params=params,
-    )
-
-    rows = data.get("data", []) if isinstance(data, dict) else data
-
-    if not rows:
-        raise RuntimeError("Mum verisi boş geldi.")
-
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "time", "open", "high", "low", "close",
-            "volume", "close_time", "quote_volume",
-            "trades", "buy_volume", "buy_quote_volume", "ignore",
-        ],
-    )
-
-    for col in [
-        "open", "high", "low", "close",
-        "volume", "quote_volume", "buy_quote_volume",
-    ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["close", "volume"])
-    return df
-
-
-def analyze_symbol(symbol):
-    df = load_klines(symbol)
-
-    if len(df) < 5:
-        raise RuntimeError("Analiz için yeterli mum yok.")
-
-    # Son mum hâlâ açık olabileceği için kapanmış mumları kullan.
-    closed = df.iloc[:-1].copy()
-    if len(closed) < 4:
-        raise RuntimeError("Yeterli kapanmış mum bulunamadı.")
-
-    last = closed.iloc[-1]
-    previous = closed.iloc[-4:-1]
-
-    old_volume = float(previous["volume"].mean())
-    current_volume = float(last["volume"])
-    volume_ratio = (
-        current_volume / old_volume if old_volume > 0 else 0
-    )
-
-    first_close = float(closed.iloc[-2]["close"])
-    last_close = float(last["close"])
-    change_pct = (
-        (last_close / first_close - 1) * 100
-        if first_close else 0
-    )
-
-    candle_range = float(last["high"] - last["low"])
-    candle_body = abs(float(last["close"] - last["open"]))
-    wick_ratio = (
-        (candle_range - candle_body) / candle_range
-        if candle_range > 0 else 0
-    )
-
-    if volume_ratio >= 3:
-        signal = "HACİM SIÇRAMASI"
-    elif change_pct >= 1:
-        signal = "YUKARI HAREKET"
-    elif change_pct <= -1:
-        signal = "AŞAĞI HAREKET"
-    else:
-        signal = "TAKİPTE"
-
-    return {
-        "Parite": symbol,
-        "Son kapanış": last_close,
-        "Değişim %": round(change_pct, 3),
-        "Hacim oranı": round(volume_ratio, 2),
-        "Fitil oranı %": round(wick_ratio * 100, 1),
-        "Durum": signal,
-    }
-
-
-# ---------- SOL MENÜ ----------
-
-st.sidebar.header("Borsa bağlantısı")
-st.sidebar.caption("API anahtarlarını GitHub koduna yazma.")
-
-api_key = st.sidebar.text_input("API Key", type="password")
-secret_key = st.sidebar.text_input("Secret Key", type="password")
-
-if st.sidebar.button("Hesap bağlantısını kontrol et"):
-    if not api_key or not secret_key:
-        st.sidebar.warning("İki alanı da doldur.")
-    else:
+def get_symbols():
+    errors = []
+    # Official Binance TR symbols endpoint
+    try:
+        data = request_json(TR_BASE + "/open/v1/common/symbols")
+        rows = unwrap_list(data)
+        rows = [x for x in rows if isinstance(x, dict) and x.get("symbol")]
+        if rows:
+            return rows, "Binance TR sembol listesi"
+    except Exception as e:
+        errors.append(str(e))
+    # Public market metadata fallback
+    for base in PUBLIC_BASES:
         try:
-            result = account_request(api_key, secret_key)
-            account = result.get("data", {})
-            assets = account.get("accountAssets", [])
-
-            if not isinstance(assets, list):
-                raise RuntimeError(
-                    "Hesap varlık yanıtı beklenen biçimde değil."
-                )
-
-            rows = []
-            for item in assets:
-                free = float(item.get("free", 0) or 0)
-                locked = float(item.get("locked", 0) or 0)
-
-                if free + locked > 0:
-                    rows.append({
-                        "Varlık": item.get("asset", "?"),
-                        "Kullanılabilir": free,
-                        "Kilitlemiş": locked,
-                        "Toplam": free + locked,
-                    })
-
-            st.session_state.account_assets = rows
-            st.session_state.account_status = "Bağlantı başarılı"
-            st.sidebar.success("Hesap bilgisi alındı.")
-
+            data = request_json(base + "/api/v3/exchangeInfo")
+            rows = data.get("symbols", []) if isinstance(data, dict) else []
+            if rows:
+                converted = []
+                for x in rows:
+                    sym = x.get("symbol", "")
+                    quote = x.get("quoteAsset", "")
+                    if quote == "TRY":
+                        converted.append({"symbol": sym, "baseAsset": x.get("baseAsset", ""),
+                                          "quoteAsset": quote, "status": x.get("status", ""),
+                                          "type": 1, "_raw_symbol": sym})
+                if converted:
+                    return converted, f"{base} exchangeInfo"
         except Exception as e:
-            st.session_state.account_status = "Bağlantı hatası"
-            st.sidebar.error(str(e))
+            errors.append(str(e))
+    raise RuntimeError("Sembol listesi alınamadı. " + " | ".join(errors[-2:]))
 
-st.sidebar.write("Durum:", st.session_state.account_status)
+def market_tickers():
+    errors = []
+    for base in PUBLIC_BASES:
+        try:
+            data = request_json(base + "/api/v3/ticker/24hr")
+            if isinstance(data, list):
+                return data, base
+        except Exception as e:
+            errors.append(str(e))
+    raise RuntimeError("Piyasa verileri alınamadı. " + " | ".join(errors[-2:]))
 
-# ---------- ÖZET ----------
+def symbol_api_name(symbol):
+    return str(symbol).replace("_", "")
 
-a, b, c = st.columns(3)
-a.metric("Çalışma modu", "Analiz")
-b.metric("Gerçek emir", "Kapalı")
-c.metric("Hesap", st.session_state.account_status)
+def get_account(api_key, secret):
+    return signed_request("/open/v1/account/spot", api_key, secret)
 
-tab1, tab2, tab3 = st.tabs([
-    "📊 Genel Bakış",
-    "🐋 Hacim Radarı",
-    "🛡️ Risk ve İğne Filtresi",
-])
+def normalize_balances(payload):
+    rows = unwrap_list(payload)
+    if rows and any(("asset" in x or "a" in x) for x in rows if isinstance(x, dict)):
+        return rows
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if isinstance(data, dict):
+        if "balances" in data and isinstance(data["balances"], list):
+            return data["balances"]
+        if "asset" in data:
+            return [data]
+    return []
 
-# ---------- GENEL BAKIŞ ----------
+def submit_order(api_key, secret, symbol, side, order_type, quantity, quote_qty, price):
+    # Binance TR docs: side 0=BUY, 1=SELL; type 1=LIMIT, 2=MARKET.
+    params = {"symbol": symbol, "side": 0 if side == "AL" else 1,
+              "type": 2 if order_type == "MARKET" else 1}
+    if order_type == "MARKET" and side == "AL" and quote_qty:
+        params["quoteOrderQty"] = str(quote_qty)
+    else:
+        params["quantity"] = str(quantity)
+    if order_type == "LIMIT":
+        params["price"] = str(price)
+        params["timeInForce"] = 1
+    return signed_request("/open/v1/orders", api_key, secret, params, "POST")
+
+def fmt_num(v, digits=2):
+    try:
+        return f"{float(v):,.{digits}f}"
+    except Exception:
+        return "—"
+
+st.title("🤖 CEX T1 — Otomatik Kripto & Balina Radarı")
+st.caption("Binance TR • Spot / TRY • Piyasa taraması, hesap bağlantısı ve kontrollü emir paneli")
+
+with st.sidebar:
+    st.header("BORSA VE BAĞLANTI")
+    st.selectbox("Borsa Seçin", ["Binance TR (Spot - TRY)"], key="exchange")
+    api_key = st.text_input("Erişim Anahtarı (API Key)", type="password", key="api_key")
+    secret = st.text_input("Gizli Anahtar (Secret Key)", type="password", key="secret")
+    connect = st.button("🔌 Bağlantıyı Kur / Yenile", use_container_width=True)
+    if connect:
+        if not api_key or not secret:
+            st.error("API Key ve Secret Key gir.")
+        else:
+            try:
+                acc = get_account(api_key, secret)
+                st.session_state["account_payload"] = acc
+                st.session_state["connected"] = True
+                st.success("Binance TR özel API yanıt verdi.")
+            except Exception as e:
+                st.session_state["connected"] = False
+                st.error(f"Bağlantı doğrulanamadı: {e}")
+    if st.session_state.get("connected"):
+        st.success("✅ Özel API bağlantısı doğrulandı")
+    else:
+        st.info("API bilgilerini girip bağlantıyı doğrula.")
+    st.caption("Güvenlik: API anahtarlarını sohbetle paylaşma. Mümkünse yalnızca okuma ve spot işlem izinleri ver; çekim iznini kapalı tut.")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Genel Bakış", "⚙️ Strateji ve Risk", "🐋 Balina & Hacim Radarı", "🛒 Emir / Otomasyon"])
+
+with st.spinner("Piyasa verileri kontrol ediliyor..."):
+    try:
+        symbols, symbols_source = get_symbols()
+        tickers, ticker_source = market_tickers()
+        tickmap = {str(t.get("symbol", "")): t for t in tickers if isinstance(t, dict)}
+        market_rows = []
+        for s in symbols:
+            symbol = str(s.get("symbol", ""))
+            quote = s.get("quoteAsset", "")
+            status = s.get("status", "")
+            if quote and quote != "TRY":
+                continue
+            if status and status not in ("TRADING", "1", 1):
+                continue
+            api_symbol = symbol_api_name(symbol)
+            t = tickmap.get(api_symbol) or tickmap.get(symbol)
+            if not t:
+                continue
+            try:
+                price = float(t.get("lastPrice", t.get("last", 0)) or 0)
+                change = float(t.get("priceChangePercent", t.get("priceChangePercent24h", 0)) or 0)
+                volume = float(t.get("quoteVolume", t.get("quoteVolume24h", 0)) or 0)
+                market_rows.append({"Parite": symbol.replace("_", "/"), "API sembolü": api_symbol,
+                                    "Fiyat": price, "24s değişim %": change, "24s hacim": volume})
+            except (ValueError, TypeError):
+                continue
+        market_df = pd.DataFrame(market_rows)
+        if not market_df.empty:
+            market_df = market_df.sort_values("24s hacim", ascending=False).reset_index(drop=True)
+        st.session_state["market_df"] = market_df
+        st.session_state["symbols_source"] = symbols_source
+        st.session_state["ticker_source"] = ticker_source
+        market_error = None
+    except Exception as e:
+        market_error = str(e)
+        market_df = st.session_state.get("market_df", pd.DataFrame())
+
+account_payload = st.session_state.get("account_payload")
+balances = normalize_balances(account_payload) if account_payload else []
+balance_rows = []
+for b in balances:
+    if not isinstance(b, dict):
+        continue
+    asset = b.get("asset", b.get("a", ""))
+    free = b.get("free", b.get("f", 0))
+    locked = b.get("locked", b.get("l", 0))
+    try:
+        if float(free or 0) or float(locked or 0):
+            balance_rows.append({"Varlık": asset, "Kullanılabilir": float(free or 0), "Kilitte": float(locked or 0)})
+    except Exception:
+        pass
 
 with tab1:
-    st.subheader("Hesaptaki varlıklar")
-
-    if st.session_state.account_assets:
-        st.dataframe(
-            pd.DataFrame(st.session_state.account_assets),
-            use_container_width=True,
-            hide_index=True,
-        )
+    if market_error:
+        st.error("Piyasa verisi sorunu: " + market_error)
+        st.caption("HTTP 451 görülüyorsa bu, isteğin çalıştığı sunucu/ağ için erişim engelidir; başka endpoint denemek her zaman çözmez.")
     else:
-        st.info("Hesap bakiyesi için sol menüden bağlantı kur.")
-
-    st.subheader("TRY pariteleri")
-
-    if st.button("Parite listesini getir"):
-        try:
-            symbols = load_symbols()
-            st.session_state["symbols"] = symbols
-            st.success(f"{len(symbols)} parite bulundu.")
-        except Exception as e:
-            st.error(f"Parite listesi alınamadı: {e}")
-
-    symbols = st.session_state.get("symbols", [])
-    if symbols:
-        st.dataframe(
-            pd.DataFrame({"Parite": symbols}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-# ---------- HACİM RADARI ----------
+        st.caption(f"Sembol kaynağı: {st.session_state.get('symbols_source','—')} • Fiyat kaynağı: {st.session_state.get('ticker_source','—')}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Gösterilen parite", str(len(market_df)))
+    c2.metric("Piyasa", "TRY Spot")
+    c3.metric("Hesap API", "Bağlı" if st.session_state.get("connected") else "Bağlı değil")
+    c4.metric("Varlık satırı", str(len(balance_rows)))
+    st.subheader("Canlı Piyasa Radarı")
+    if not market_df.empty:
+        st.dataframe(market_df[["Parite", "Fiyat", "24s değişim %", "24s hacim"]], use_container_width=True, hide_index=True)
+    else:
+        st.warning("Henüz piyasa tablosu alınamadı. Sunucu erişimi engelliyse kod tek başına bu engeli kaldıramaz.")
+    st.subheader("Hesap Bakiyeleri")
+    if not st.session_state.get("connected"):
+        st.info("Bakiyeyi görmek için sol taraftan API bağlantısını doğrula.")
+    elif balance_rows:
+        st.dataframe(pd.DataFrame(balance_rows), use_container_width=True, hide_index=True)
+    else:
+        st.warning("API yanıt verdi fakat bakiye alanları tanınamadı. Yanıt şeması kontrol edilmeli.")
 
 with tab2:
-    st.subheader("Gerçek mum verisiyle hacim taraması")
-
-    try:
-        symbols = st.session_state.get("symbols") or load_symbols()
-        st.session_state["symbols"] = symbols
-
-        # İstek yükünü kontrol altında tutmak için tarama sınırı.
-        limit = st.slider(
-            "Taranacak ilk parite sayısı",
-            min_value=1,
-            max_value=min(30, len(symbols)),
-            value=min(10, len(symbols)),
-        )
-
-        if st.button("Taramayı başlat", type="primary"):
-            results = []
-            errors = []
-
-            progress = st.progress(0)
-
-            for i, symbol in enumerate(symbols[:limit]):
-                try:
-                    results.append(analyze_symbol(symbol))
-                except Exception as e:
-                    errors.append({
-                        "Parite": symbol,
-                        "Hata": str(e),
-                    })
-
-                progress.progress((i + 1) / limit)
-
-            if results:
-                result_df = pd.DataFrame(results)
-                result_df = result_df.sort_values(
-                    "Hacim oranı", ascending=False
-                )
-                st.dataframe(
-                    result_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            if errors:
-                with st.expander(
-                    f"Veri alınamayan pariteler ({len(errors)})"
-                ):
-                    st.dataframe(
-                        pd.DataFrame(errors),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-            if not results:
-                st.error(
-                    "Hiçbir pariteden veri alınamadı. "
-                    "API erişimini ve sembol biçimini kontrol et."
-                )
-
-    except Exception as e:
-        st.error(f"Radar başlatılamadı: {e}")
-
-    st.caption(
-        "Hacim oranı, son kapanmış mumun hacmini önceki "
-        "3 kapanmış mumun ortalamasıyla karşılaştırır. "
-        "Bu tek başına balina işlemi kanıtı değildir."
-    )
-
-# ---------- RİSK VE FİLTRE ----------
+    st.subheader("Strateji ve Risk Ayarları")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.selectbox("Strateji", ["Hacim + momentum + emir defteri", "Hareketli ortalama kesişimi", "RSI tabanlı"], key="strategy")
+        st.number_input("İşlem başına azami bütçe (TRY)", min_value=0.0, value=100.0, step=25.0, key="max_budget")
+        st.number_input("Kâr alma (%)", min_value=0.1, value=2.0, step=0.1, key="take_profit")
+    with col2:
+        st.number_input("Zarar durdur (%)", min_value=0.1, value=1.0, step=0.1, key="stop_loss")
+        st.number_input("Günlük azami işlem sayısı", min_value=1, value=3, step=1, key="max_trades")
+        st.number_input("Büyük işlem eşiği (TRY)", min_value=1000.0, value=50000.0, step=5000.0, key="whale_threshold")
+    st.warning("Bu ayarlar burada saklanan strateji parametreleridir. Otomatik döngü ve pozisyon takibi, güvenilir sürekli çalışan bir sunucu ve borsa emir/işlem sorgularıyla ayrıca işletilmelidir.")
 
 with tab3:
-    st.subheader("Risk parametreleri")
+    st.subheader("Balina & Hacim Radarı")
+    threshold = float(st.session_state.get("whale_threshold", 50000.0))
+    if not market_df.empty:
+        radar = market_df.copy()
+        radar["Sinyal"] = radar["24s değişim %"].apply(lambda x: "AL adayı" if x >= 2 else ("SAT baskısı" if x <= -2 else "BEKLE"))
+        radar["Hacim etiketi"] = radar["24s hacim"].apply(lambda x: "Yüksek hacim" if x >= (radar["24s hacim"].median() if len(radar) else 0) else "Normal")
+        st.dataframe(radar[["Parite", "Fiyat", "24s değişim %", "24s hacim", "Sinyal", "Hacim etiketi"]], use_container_width=True, hide_index=True)
+        st.caption("Bu ekran 24 saatlik fiyat/hacim verisinden aday çıkarır; gerçek büyük işlemleri/cüzdanları tespit ettiğini iddia etmez.")
+    else:
+        st.info("Balina radarı için piyasa verisi gerekli.")
 
-    with st.form("risk_form"):
-        budget = st.number_input(
-            "İşlem bütçesi (TRY)",
-            min_value=0.0,
-            value=1000.0,
-            step=100.0,
-        )
-        risk_pct = st.number_input(
-            "İşlem başına risk (%)",
-            min_value=0.1,
-            max_value=5.0,
-            value=1.0,
-            step=0.1,
-        )
-        stop_pct = st.number_input(
-            "Stop-loss mesafesi (%)",
-            min_value=0.1,
-            max_value=20.0,
-            value=1.5,
-            step=0.1,
-        )
-        target_pct = st.number_input(
-            "Kâr hedefi (%)",
-            min_value=0.1,
-            max_value=50.0,
-            value=2.5,
-            step=0.1,
-        )
-        wick_filter = st.checkbox(
-            "Yüksek fitil oranını uyarı olarak göster",
-            value=True,
-        )
-        threshold = st.slider(
-            "Fitil uyarı eşiği (%)",
-            min_value=20,
-            max_value=95,
-            value=65,
-        )
-
-        save = st.form_submit_button("Ayarları kaydet")
-
-    if save:
-        st.session_state.strategy = {
-            "budget": budget,
-            "risk_pct": risk_pct,
-            "stop_pct": stop_pct,
-            "target_pct": target_pct,
-            "wick_filter": wick_filter,
-            "wick_threshold": threshold,
-        }
-
-    if st.session_state.strategy:
-        settings = st.session_state.strategy
-        st.success("Ayarlar bu oturum için kaydedildi.")
-        st.write(
-            "Planlanan risk bütçesi:",
-            round(
-                settings["budget"] * settings["risk_pct"] / 100,
-                2,
-            ),
-            "TRY",
-        )
-        st.write(
-            "Stop mesafesi:",
-            settings["stop_pct"],
-            "%",
-            "| Kâr hedefi:",
-            settings["target_pct"],
-            "%",
-        )
-
-        if settings["wick_filter"]:
-            st.write(
-                "Fitil uyarı eşiği:",
-                settings["wick_threshold"],
-                "%",
-            )
-
-    st.info(
-        "Bu risk ayarları yalnızca hesaplama ve görüntüleme içindir. "
-        "Emir oluşturmaz, stop emri göndermez ve tasfiyeyi engellemez."
-    )
+with tab4:
+    st.subheader("Manuel Emir")
+    if not api_key or not secret:
+        st.info("Emir göndermek için API bilgilerini gir ve bağlantıyı doğrula.")
+    col1, col2 = st.columns(2)
+    with col1:
+        if not market_df.empty:
+            options = market_df["API sembolü"].tolist()
+            selected_symbol = st.selectbox("Parite", options, key="order_symbol")
+        else:
+            selected_symbol = st.text_input("Parite (ör. BTC_TRY)", value="BTC_TRY")
+        side = st.radio("İşlem", ["AL", "SAT"], horizontal=True)
+        order_type = st.radio("Emir türü", ["MARKET", "LIMIT"], horizontal=True)
+    with col2:
+        quantity = st.text_input("Miktar (coin) — SAT veya LIMIT AL için", value="")
+        quote_qty = st.text_input("MARKET AL için harcanacak TRY tutarı", value="")
+        price = st.text_input("Limit fiyatı (LIMIT seçildiğinde)", value="")
+    st.warning("Gerçek emir bakiyeni etkiler. Önce küçük tutarla test et. Market alışta TRY tutarı kullanılır; satışta coin miktarı gerekir.")
+    confirm_live = st.checkbox("Gerçek emir göndereceğimi ve bakiyemin etkilenebileceğini anlıyorum.")
+    if st.button("📨 Emri Gönder", type="primary", use_container_width=True):
+        if not api_key or not secret:
+            st.error("API Key ve Secret Key gerekli.")
+        elif not confirm_live:
+            st.error("Gerçek emir onay kutusunu işaretlemelisin.")
+        else:
+            try:
+                # Validate fields before request
+                if order_type == "MARKET" and side == "AL":
+                    if not quote_qty or Decimal(quote_qty) <= 0:
+                        raise ValueError("Pozitif TRY tutarı gir.")
+                    qty = None
+                else:
+                    if not quantity or Decimal(quantity) <= 0:
+                        raise ValueError("Pozitif coin miktarı gir.")
+                    qty = quantity
+                if order_type == "LIMIT" and (not price or Decimal(price) <= 0):
+                    raise ValueError("Limit fiyatı pozitif olmalı.")
+                # Last explicit confirmation required immediately before sending.
+                with st.spinner("Borsa emri yanıtlıyor..."):
+                    result = submit_order(api_key, secret, selected_symbol, side, order_type,
+                                          qty, quote_qty if order_type == "MARKET" and side == "AL" else None,
+                                          price if order_type == "LIMIT" else None)
+                st.success("Borsadan emir yanıtı alındı:")
+                st.json(result)
+            except Exception as e:
+                st.error(f"Emir gönderilemedi veya sonucu doğrulanamadı: {e}")
+    st.divider()
+    st.subheader("Otomatik işlem durumu")
+    st.info("Bu tek dosyalı Streamlit sürümünde otomatik emir döngüsü varsayılan olarak ÇALIŞMAZ. Sayfa yenilenmesi/uyku nedeniyle canlı otomasyon güvenilir değildir. Strateji parametreleri ve manuel emir bağlantısı mevcuttur; gerçek otomatik bot için sürekli çalışan bir worker, emir durum takibi, stop/kâr alma yönetimi ve günlük limitler eklenmelidir.")
+    st.checkbox("Otomatik işlem için niyet/onay (yalnızca arayüz; döngüyü başlatmaz)", key="auto_intent")
+    st.caption("Bu onay otomasyonu başlatmaz; yanlışlıkla gerçek emir döngüsü çalıştırılmaması için bu sürümde otomatik emir gönderimi kapalıdır.")
 
 st.divider()
-st.caption(
-    "CEX T1 V2 • Veri alınamadığında hata gösterilir; "
-    "örnek veriler gerçek piyasa verisi gibi sunulmaz."
-)
+st.caption("CEX T1 • Binance TR API • Gerçek piyasa ve hesap API'si erişilebilirliği barındırma sunucusuna bağlıdır. API anahtarlarında para çekme izni açmayın.")
