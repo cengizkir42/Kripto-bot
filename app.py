@@ -1,5 +1,9 @@
 import streamlit as st
 import pandas as pd
+import requests
+import hmac
+import hashlib
+import time
 import ccxt
 
 # --- PAGE CONFIG ---
@@ -20,26 +24,33 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
+# --- HELPER: DIRECT BINANCE TR BALANCE CHECK ---
+def get_binance_tr_balance(key, secret):
+    url = "https://tr.binance.com/open/v1/account/spot"
+    timestamp = int(time.time() * 1000)
+    query_string = f"timestamp={timestamp}"
+    signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    headers = {
+        'X-MBX-APIKEY': key
+    }
+    
+    full_url = f"{url}?{query_string}&signature={signature}"
+    response = requests.get(full_url, headers=headers, timeout=10)
+    data = response.json()
+    
+    if response.status_code == 200 and data.get("code") == 0:
+        return data.get("data", {})
+    else:
+        raise Exception(data.get("msg", "Binance TR API Hatası"))
+
 # --- EXCHANGE INITIALIZATION ---
 @st.cache_resource
 def init_exchange(borsa, key, secret):
     if not key or not secret:
         return None
     try:
-        if "Binance TR" in borsa:
-            return ccxt.binance({
-                'apiKey': key,
-                'secret': secret,
-                'enableRateLimit': True,
-                'options': {'adjustForTimeDifference': True},
-                'urls': {
-                    'api': {
-                        'public': 'https://tr.binance.com/open/v1',
-                        'private': 'https://tr.binance.com/open/v1',
-                    }
-                }
-            })
-        elif "Binance USDT-M" in borsa:
+        if "Binance USDT-M" in borsa:
             return ccxt.binance({
                 'apiKey': key,
                 'secret': secret,
@@ -48,6 +59,8 @@ def init_exchange(borsa, key, secret):
             })
         elif "OKX" in borsa:
             return ccxt.okx({'apiKey': key, 'secret': secret, 'enableRateLimit': True})
+        else:
+            return "BINANCE_TR"
     except Exception as e:
         st.sidebar.error(f"Bağlantı hatası: {e}")
         return None
@@ -55,10 +68,14 @@ def init_exchange(borsa, key, secret):
 exchange = init_exchange(borsa_secimi, api_key, secret_key)
 
 if st.sidebar.button("Bağlantıyı Kur / Yenile"):
-    if exchange:
+    if api_key and secret_key:
         try:
-            balance = exchange.fetch_balance()
-            st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
+            if "Binance TR" in borsa_secimi:
+                data = get_binance_tr_balance(api_key, secret_key)
+                st.sidebar.success(f"Binance TR bağlantısı başarılı!")
+            else:
+                balance = exchange.fetch_balance()
+                st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
         except Exception as e:
             st.sidebar.error(f"API Doğrulama Hatası: {e}")
     else:
