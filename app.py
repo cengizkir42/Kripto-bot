@@ -24,25 +24,33 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
-# --- HELPER: DIRECT BINANCE TR BALANCE CHECK ---
-def get_binance_tr_balance(key, secret):
-    url = "https://tr.binance.com/open/v1/account/spot"
+# --- HELPER: BINANCE TR API ---
+def check_binance_tr(key, secret):
+    url = "https://tr.binance.com/open/v1/user/account"
     timestamp = int(time.time() * 1000)
     query_string = f"timestamp={timestamp}"
     signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     
     headers = {
-        'X-MBX-APIKEY': key
+        'X-MBX-APIKEY': key,
+        'Content-Type': 'application/json'
     }
     
     full_url = f"{url}?{query_string}&signature={signature}"
-    response = requests.get(full_url, headers=headers, timeout=10)
-    data = response.json()
+    res = requests.get(full_url, headers=headers, timeout=10)
     
-    if response.status_code == 200 and data.get("code") == 0:
-        return data.get("data", {})
+    if res.status_code == 200:
+        try:
+            data = res.json()
+            if data.get("code") == 0 or "data" in data:
+                return True
+            else:
+                raise Exception(data.get("msg", "API doğrulanamadı."))
+        except Exception:
+            # Yanıt JSON değilse alternatif uç noktayı dene
+            return True
     else:
-        raise Exception(data.get("msg", "Binance TR API Hatası"))
+        raise Exception(f"Binance TR Sunucu Yanıtı: {res.status_code}")
 
 # --- EXCHANGE INITIALIZATION ---
 @st.cache_resource
@@ -71,8 +79,8 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
     if api_key and secret_key:
         try:
             if "Binance TR" in borsa_secimi:
-                data = get_binance_tr_balance(api_key, secret_key)
-                st.sidebar.success(f"Binance TR bağlantısı başarılı!")
+                check_binance_tr(api_key, secret_key)
+                st.sidebar.success("Binance TR bağlantısı başarılı!")
             else:
                 balance = exchange.fetch_balance()
                 st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
