@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import ccxt
-import time
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="CEX T1 - Kripto Bot", layout="wide", initial_sidebar_state="expanded")
@@ -28,7 +27,12 @@ def init_exchange(borsa, key, secret):
         return None
     try:
         if "Binance TR" in borsa:
-            return ccxt.binancetr({'apiKey': key, 'secret': secret, 'enableRateLimit': True})
+            return ccxt.binance({
+                'apiKey': key,
+                'secret': secret,
+                'hostname': 'tr.binance.com',
+                'enableRateLimit': True
+            })
         elif "Binance USDT-M" in borsa:
             return ccxt.binance({
                 'apiKey': key,
@@ -46,7 +50,11 @@ exchange = init_exchange(borsa_secimi, api_key, secret_key)
 
 if st.sidebar.button("Bağlantıyı Kur / Yenile"):
     if exchange:
-        st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
+        try:
+            balance = exchange.fetch_balance()
+            st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
+        except Exception as e:
+            st.sidebar.error(f"API Doğrulama Hatası: {e}")
     else:
         st.sidebar.warning("Lütfen geçerli API Key ve Secret Key girin.")
 
@@ -72,9 +80,8 @@ with tab1:
     st.subheader("Açık Pozisyonlar ve Canlı İşlemler")
     st.info(f"Seçili Borsa: **{borsa_secimi}** | Birim: **{para_birimi}**")
     
-    # Örnek Tablo Yapısı
     df_pos = pd.DataFrame([
-        {"Parite": f"BTC/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.05, "Giriş Fiyatı": 2200000 if para_birimi=="TRY" else 65000, "Kâr/Zarar": f"+120.50 {para_birimi}"},
+        {"Parite": f"BTC/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.05, "Giriş Fiyatı": 4046149 if para_birimi=="TRY" else 65000, "Kâr/Zarar": f"+120.50 {para_birimi}"},
         {"Parite": f"ETH/{para_birimi}", "Yön": "LONG / AL", "Miktar": 0.50, "Giriş Fiyatı": 115000 if para_birimi=="TRY" else 3400, "Kâr/Zarar": f"-15.20 {para_birimi}"}
     ])
     st.dataframe(df_pos, use_container_width=True)
@@ -86,12 +93,12 @@ with tab2:
     c1, c2 = st.columns(2)
     with c1:
         st.number_input(f"İlk Giriş Teminat Üst Sınırı ({para_birimi})", value=1000.0 if para_birimi=="TRY" else 40.0)
-        st.number_input("Pozisyon Başına Risk Bütçesi %", value=0.50)
-        st.number_input("Kesin Zarar Kes (Stop-Loss) %", value=0.70)
+        st.number_input("Pozisyon Başına Risk Bütçesi %", value=1.00 if para_birimi=="TRY" else 0.50)
+        st.number_input("Kesin Zarar Kes (Stop-Loss) %", value=1.50)
         st.number_input("Zorunlu Taşfiye Koruma Mesafesi %", value=1.50)
     with c2:
-        st.number_input("İlk Kâr Al Hedefi %", value=1.00)
-        st.number_input("İzleyen Zarar Kesişi (Trailing Stop) %", value=0.70)
+        st.number_input("İlk Kâr Al Hedefi %", value=2.50)
+        st.number_input("İzleyen Zarar Kesişi (Trailing Stop) %", value=1.00)
         st.number_input("Giriş Puanı Eşiği (100 Üzerinden)", value=75)
         st.number_input("Aynı Anda Açık Pozisyon Sınırı", value=2)
         
@@ -103,7 +110,6 @@ with tab3:
     st.subheader("🐋 Balina Girişleri ve Ani Hacim Patlamaları")
     st.write("Bu radar, ortalama hacminin 2.5 katı üzerine çıkan ve ani fiyat hareketi yapan pariteleri anlık yakalar.")
     
-    # Örnek Hacim Radarı Tablosu
     df_whale = pd.DataFrame([
         {"Parite": f"XRP/{para_birimi}", "Son Hacim Artışı": "4.2x (Balina Girişi)", "Fiyat Değişimi (15dk)": "+4.8%", "Sinyal": "ÇOK GÜÇLÜ AL"},
         {"Parite": f"1000SATS/{para_birimi}", "Son Hacim Artışı": "2.8x (Hacim Sıçraması)", "Fiyat Değişimi (15dk)": "+2.3%", "Sinyal": "GÜÇLÜ AL"},
@@ -118,6 +124,6 @@ with tab4:
     
     st.checkbox("İğne Atma Korumasını Aktif Et", value=True)
     st.selectbox("Kapanış Onayı Zaman Dilimi", ["1 Dakikalık Mum Kapanışı", "3 Dakikalık Mum Kapanışı", "5 Dakikalık Mum Kapanışı"])
-    st.number_input("İğne Teyit Bekleme Süresi (Saniye)", value=3, help="Fiyat stop seviyesini ihlal ettikten sonra kaç saniye beklenip onay alınacağını belirler.")
+    st.number_input("İğne Teyit Bekleme Süresi (Saniye)", value=3)
     
     st.info("💡 **Nasıl Çalışır?** Fiyat anlık olarak stop seviyenizin altına iğne atarsa bot hemen satmaz. Belirlenen bekleme süresi veya mum kapanışı boyunca fiyat orada kalıcı olursa stop işlemini onaylar.")
