@@ -11,6 +11,12 @@ st.set_page_config(page_title="CEX T1 - Kripto Bot", layout="wide", initial_side
 
 st.title("🤖 CEX T1 - Otomatik Kripto & Balina Radarı Botu")
 
+# --- SESSION STATE INITIALIZATION ---
+if "toplam_bakiye" not in st.session_state:
+    st.session_state["toplam_bakiye"] = 0.0
+if "kullanilabilir_bakiye" not in st.session_state:
+    st.session_state["kullanilabilir_bakiye"] = 0.0
+
 # --- SIDEBAR CONFIG ---
 st.sidebar.header("BORSA VE BAĞLANTI")
 
@@ -24,11 +30,11 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
-# --- HELPER: BINANCE TR API ---
-def check_binance_tr(key, secret):
+# --- HELPER: BINANCE TR CANLI BAKİYE VE HESAP VERİSİ ---
+def get_binance_tr_account(key, secret):
     url = "https://tr.binance.com/open/v1/user/account"
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"recvWindow=10000&timestamp={timestamp}"
     signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     
     headers = {
@@ -39,21 +45,18 @@ def check_binance_tr(key, secret):
     full_url = f"{url}?{query_string}&signature={signature}"
     res = requests.get(full_url, headers=headers, timeout=10)
     
-    if res.status_code == 200:
+    if res.status_code in [200, 201, 202]:
         try:
             data = res.json()
-            if data.get("code") == 0 or "data" in data:
-                return True
-            else:
-                raise Exception(data.get("msg", "API doğrulanamadı."))
+            if isinstance(data, dict):
+                return data.get("data", data)
+            return {}
         except Exception:
-            # Yanıt JSON değilse alternatif uç noktayı dene
-            return True
+            return {}
     else:
-        raise Exception(f"Binance TR Sunucu Yanıtı: {res.status_code}")
+        raise Exception(f"Binance TR Sunucu Hatası: HTTP {res.status_code}")
 
 # --- EXCHANGE INITIALIZATION ---
-@st.cache_resource
 def init_exchange(borsa, key, secret):
     if not key or not secret:
         return None
@@ -79,11 +82,29 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
     if api_key and secret_key:
         try:
             if "Binance TR" in borsa_secimi:
-                check_binance_tr(api_key, secret_key)
-                st.sidebar.success("Binance TR bağlantısı başarılı!")
+                account_info = get_binance_tr_account(api_key, secret_key)
+                
+                try_free = 0.0
+                try_total = 0.0
+                
+                balances = []
+                if isinstance(account_info, dict):
+                    balances = account_info.get("balances", [])
+                
+                for b in balances:
+                    if isinstance(b, dict) and b.get("asset") == "TRY":
+                        try_free = float(b.get("free") or 0.0)
+                        try_total = try_free + float(b.get("locked") or 0.0)
+                        break
+                
+                st.session_state["toplam_bakiye"] = try_total
+                st.session_state["kullanilabilir_bakiye"] = try_free
+                st.sidebar.success("✅ Binance TR bağlantısı başarılı!")
             else:
                 balance = exchange.fetch_balance()
-                st.sidebar.success(f"{borsa_secimi} bağlantısı başarılı!")
+                st.session_state["toplam_bakiye"] = float(balance.get('total', {}).get('USDT', 0.0))
+                st.session_state["kullanilabilir_bakiye"] = float(balance.get('free', {}).get('USDT', 0.0))
+                st.sidebar.success(f"✅ {borsa_secimi} bağlantısı başarılı!")
         except Exception as e:
             st.sidebar.error(f"API Doğrulama Hatası: {e}")
     else:
@@ -91,8 +112,8 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
 
 # --- DASHBOARD METRICS ---
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Toplam Hesap Değeri", f"0.00 {para_birimi}")
-col2.metric("Kullanılabilir Teminat", f"0.00 {para_birimi}")
+col1.metric("Toplam Hesap Değeri", f"{st.session_state['toplam_bakiye']:.2f} {para_birimi}")
+col2.metric("Kullanılabilir Teminat", f"{st.session_state['kullanilabilir_bakiye']:.2f} {para_birimi}")
 col3.metric("Kâr / Zarar %", "+0.00%")
 col4.metric("Aktif Para Birimi", para_birimi)
 
