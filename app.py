@@ -32,9 +32,10 @@ secret_key = st.sidebar.text_input("Gizli Anahtar (Secret Key)", type="password"
 
 para_birimi = "TRY" if "Binance TR" in borsa_secimi else "USDT"
 
-# --- HELPER: BINANCE TR CANLI BAKİYE KONTROLÜ ---
-def get_binance_tr_account(key, secret):
-    url = "https://tr.binance.com/open/v1/user/account"
+# --- HELPER: BINANCE TR CANLI BAKİYE DETAYI ---
+def get_binance_tr_balances(key, secret):
+    # Binance TR cüzdan bakiye uç noktası
+    url = "https://tr.binance.com/open/v1/asset/wallet/balance"
     timestamp = int(time.time() * 1000)
     query_string = f"recvWindow=10000&timestamp={timestamp}"
     signature = hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -47,12 +48,18 @@ def get_binance_tr_account(key, secret):
     full_url = f"{url}?{query_string}&signature={signature}"
     res = requests.get(full_url, headers=headers, timeout=10)
     
+    # Eğer ilk uç nokta yanıt vermezse kullanıcı uç noktasını yedek olarak çağır
+    if res.status_code not in [200, 201, 202]:
+        url_backup = "https://tr.binance.com/open/v1/user/account"
+        full_url = f"{url_backup}?{query_string}&signature={signature}"
+        res = requests.get(full_url, headers=headers, timeout=10)
+
     if res.status_code in [200, 201, 202]:
         try:
             data = res.json()
             if isinstance(data, dict):
                 return data.get("data", data)
-            return {}
+            return data
         except Exception:
             return {}
     else:
@@ -84,33 +91,35 @@ if st.sidebar.button("Bağlantıyı Kur / Yenile"):
     if api_key and secret_key:
         try:
             if "Binance TR" in borsa_secimi:
-                account_info = get_binance_tr_account(api_key, secret_key)
+                account_info = get_binance_tr_balances(api_key, secret_key)
                 
                 try_free = 0.0
                 try_total = 0.0
                 asset_list = []
                 
-                # Binance TR bakiye listesini bul
+                # Bakiye verilerini ayrıştır
                 balances = []
                 if isinstance(account_info, dict):
-                    balances = account_info.get("balances", account_info.get("assets", []))
+                    balances = account_info.get("balances", account_info.get("assets", account_info.get("list", [])))
+                elif isinstance(account_info, list):
+                    balances = account_info
                 
                 for b in balances:
                     if isinstance(b, dict):
-                        asset_name = b.get("asset", b.get("assetName", ""))
-                        free_val = float(b.get("free", b.get("freeAmount", 0.0)) or 0.0)
+                        asset_name = str(b.get("asset", b.get("assetName", b.get("symbol", ""))))
+                        free_val = float(b.get("free", b.get("freeAmount", b.get("balance", 0.0))) or 0.0)
                         locked_val = float(b.get("locked", b.get("lockedAmount", 0.0)) or 0.0)
                         total_val = free_val + locked_val
                         
                         if total_val > 0:
                             asset_list.append({
                                 "Varlık": asset_name,
-                                "Kullanılabilir": free_val,
-                                "Kilitli": locked_val,
-                                "Toplam": total_val
+                                "Kullanılabilir": round(free_val, 4),
+                                "Kilitli": round(locked_val, 4),
+                                "Toplam": round(total_val, 4)
                             })
                         
-                        if asset_name == "TRY":
+                        if asset_name.upper() == "TRY":
                             try_free = free_val
                             try_total = total_val
                 
@@ -151,7 +160,7 @@ with tab1:
     st.info(f"Seçili Borsa: **{borsa_secimi}** | Birim: **{para_birimi}**")
     
     if st.session_state["bakiye_listesi"]:
-        st.write("### 💼 Hesaptaki Varlıklar")
+        st.write("### 💼 Hesaptaki Varlıklar (Kripto & TRY)")
         st.dataframe(pd.DataFrame(st.session_state["bakiye_listesi"]), use_container_width=True)
     
     df_pos = pd.DataFrame([
